@@ -34,9 +34,14 @@ import helium314.keyboard.latin.utils.InputTypeUtils
 import helium314.keyboard.latin.utils.Log
 import helium314.keyboard.latin.utils.ToolbarKey
 import helium314.keyboard.latin.utils.prefs
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class ClipboardHistoryManager(
         private val latinIME: LatinIME
@@ -44,19 +49,27 @@ class ClipboardHistoryManager(
 
     private lateinit var clipboardManager: ClipboardManager
     private var clipboardSuggestionView: View? = null
-    private var clipboardDao: ClipboardDao? = null
+    @Volatile private var clipboardDao: ClipboardDao? = null
     private var tempPrimaryClip = false
+
+    // single parallelism so clips are processed in the order they arrive, cancelled in onDestroy
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
 
     fun onCreate() {
         clipboardManager = latinIME.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboardManager.addPrimaryClipChangedListener(this)
-        clipboardDao = ClipboardDao.getInstance(latinIME)
-        if (latinIME.mSettings.current.mClipboardHistoryEnabled)
-            fetchPrimaryClip()
+        scope.launch {
+            // creating the dao reads the whole table and checks clip files, keep that off the main thread
+            clipboardDao = ClipboardDao.getInstance(latinIME)
+            if (latinIME.mSettings.current.mClipboardHistoryEnabled)
+                withContext(Dispatchers.Main) { fetchPrimaryClip() }
+        }
     }
 
     fun onDestroy() {
         clipboardManager.removePrimaryClipChangedListener(this)
+        scope.cancel()
     }
 
     override fun onPrimaryClipChanged() {
@@ -79,11 +92,21 @@ class ClipboardHistoryManager(
         val timeStamp = ClipboardManagerCompat.getClipTimestamp(clipData)
 
         if (description.hasMimeType("text/*")) {
-            val content = clipItem.coerceToText(latinIME)
-            if (TextUtils.isEmpty(content)) return
-            clipboardDao?.addClip(timeStamp, false, content.toString())
-        } else if (maySaveFromUri(clipItem.uri, latinIME)) {
-            clipboardDao?.addClipUri(timeStamp, false, clipItem.uri, description, latinIME)
+            // coerceToText may need to resolve a content URI, that's better done off the main thread
+            scope.launch {
+                val content = clipItem.coerceToText(latinIME)
+                if (TextUtils.isEmpty(content)) return@launch
+                withContext(Dispatchers.Main) { clipboardDao?.addClip(timeStamp, false, content.toString()) }
+            }
+        } else {
+            val uri = clipItem.uri ?: return
+            // copying the content and hashing it is too slow for the main thread,
+            // only the final cache and database update happens there (see ClipboardDao threading contract)
+            scope.launch {
+                if (!maySaveFromUri(uri, latinIME)) return@launch
+                val prepared = clipboardDao?.prepareClipFile(uri, description, latinIME) ?: return@launch
+                withContext(Dispatchers.Main) { clipboardDao?.commitPreparedClip(timeStamp, false, prepared, latinIME) }
+            }
         }
     }
 
@@ -105,25 +128,28 @@ class ClipboardHistoryManager(
         // a. it can happen that we switch back before the pasting has started, in that case we only past the primary clip
         // b. if we switch while the clip is pasted, it might crash the app (tested with joplin and logseq)
         // todo: replacing the current primary clip is far from ideal, try finding a different way
-        GlobalScope.launch {
+        scope.launch {
             delay(500)
-            try {
-                clipboardManager.setPrimaryClip(primaryClip)
-            } catch (e: Exception) {
-                Log.i(TAG, "could not go back to old primary clip", e)
-                // happens wen the clip was a file
-                // try to find it in out clipboard entries
-                val clip = clipboardDao?.getAll()?.firstOrNull { it.timeStamp == ClipboardManagerCompat.getClipTimestamp(primaryClip) }
-                if (clip?.filename != null)
-                    clipboardManager.setPrimaryClip(ClipData(
-                        ClipDescription(clip.text, clip.mimeTypes?.toTypedArray()),
-                        ClipData.Item(clip.getContentUri(latinIME))
-                    ))
-                else if (clip != null)
-                    clipboardManager.setPrimaryClip(ClipData(
-                        ClipDescription("", arrayOf("text/*")),
-                        ClipData.Item(clip.text)
-                    ))
+            // back on the main thread because the fallback path reads the clipboard cache
+            withContext(Dispatchers.Main) {
+                try {
+                    clipboardManager.setPrimaryClip(primaryClip)
+                } catch (e: Exception) {
+                    Log.i(TAG, "could not go back to old primary clip", e)
+                    // happens wen the clip was a file
+                    // try to find it in out clipboard entries
+                    val clip = clipboardDao?.getAll()?.firstOrNull { it.timeStamp == ClipboardManagerCompat.getClipTimestamp(primaryClip) }
+                    if (clip?.filename != null)
+                        clipboardManager.setPrimaryClip(ClipData(
+                            ClipDescription(clip.text, clip.mimeTypes?.toTypedArray()),
+                            ClipData.Item(clip.getContentUri(latinIME))
+                        ))
+                    else if (clip != null)
+                        clipboardManager.setPrimaryClip(ClipData(
+                            ClipDescription("", arrayOf("text/*")),
+                            ClipData.Item(clip.text)
+                        ))
+                }
             }
         }
     }

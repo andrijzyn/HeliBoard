@@ -20,8 +20,14 @@ import helium314.keyboard.latin.utils.prefs
 import java.io.File
 import kotlin.collections.joinToString
 
-/** Class providing cached access to the clipboard table */
-// currently we should not need to worry about synchronizing access (though maybe we could addClip in a coroutine, then it might be relevant)
+/**
+ * Class providing cached access to the clipboard table.
+ *
+ * Threading contract: cache mutations and [listener] notifications must happen on the main thread,
+ * so positions stay consistent with what the clipboard history RecyclerView sees. The expensive
+ * part of adding a file clip is separated into [prepareClipFile], which may (and should) be called
+ * from a background thread; only the resulting [commitPreparedClip] belongs on the main thread.
+ */
 class ClipboardDao private constructor(private val db: Database) {
     interface Listener {
         fun onClipInserted(position: Int)
@@ -71,29 +77,40 @@ class ClipboardDao private constructor(private val db: Database) {
         insertNewEntry(timestamp, pinned, text, null, null, null)
     }
 
-    fun addClipUri(timestamp: Long, pinned: Boolean, uri: Uri, description: ClipDescription, context: Context) = synchronized(this) {
-        clearOldClips()
+    /** Result of [prepareClipFile], to be handed to [commitPreparedClip] */
+    class PreparedClip(val tempFile: File, val targetFile: File, val label: String?, val mimeTypes: List<String>)
+
+    /**
+     * Expensive part of adding a file clip: copies the content and hashes it.
+     * Call on a background thread, it doesn't touch cache or database.
+     * Returns null if the content could not be read.
+     */
+    fun prepareClipFile(uri: Uri, description: ClipDescription, context: Context): PreparedClip? {
         val extension = if (description.mimeTypeCount == 0) ""
             else ".${MimeTypeMap.getSingleton().getExtensionFromMimeType(description.getMimeType(0))}"
         val tempFile = File(context.filesDir, "temp_clip")
         tempFile.delete()
-        runCatching { FileUtils.copyContentUriToNewFile(uri, context, tempFile) }.onFailure { return@synchronized }
+        runCatching { FileUtils.copyContentUriToNewFile(uri, context, tempFile) }.onFailure { return null }
 
         // we set the file name to the sha256 of the content to have virtually unique names and an easy way to find duplicates
         val sha256 = ChecksumCalculator.checksum(tempFile)
-        val file = File(clipFilesDir, sha256 + extension)
+        return PreparedClip(tempFile, File(clipFilesDir, sha256 + extension), description.label?.toString(), description.getMimeTypes())
+    }
 
-        val existingIndex = cache.indexOfFirst { it.filename == file.name }
+    /** Cheap part of adding a file clip prepared by [prepareClipFile]: renames the file and updates cache and database */
+    fun commitPreparedClip(timestamp: Long, pinned: Boolean, clip: PreparedClip, context: Context) = synchronized(this) {
+        clearOldClips()
+        val existingIndex = cache.indexOfFirst { it.filename == clip.targetFile.name }
         if (existingIndex >= 0) {
             if (cache[existingIndex].timeStamp != timestamp)
                 updateTimestampAt(existingIndex, timestamp)
-            tempFile.delete()
+            clip.tempFile.delete()
             return@synchronized
         }
-        tempFile.renameTo(file)
+        clip.tempFile.renameTo(clip.targetFile)
         // we could try getting a thumbnail using context.contentResolver.loadThumbnail(uri, Size(a, b), null)
         // but currently we don't cache them anyway, so no use for that
-        insertNewEntry(timestamp, pinned, description.label?.toString(), file.name, description.getMimeTypes(), context)
+        insertNewEntry(timestamp, pinned, clip.label, clip.targetFile.name, clip.mimeTypes, context)
     }
 
     // keep pinned and the first non-pinned, others can be deleted
@@ -202,21 +219,20 @@ class ClipboardDao private constructor(private val db: Database) {
     }
 
     fun clearNonPinned() {
-        val indicesToRemove = mutableListOf<Int>()
-        cache.forEachIndexed { idx, clip ->
-            if (!clip.isPinned)
-                indicesToRemove.add(idx)
-        }
-        if (indicesToRemove.isEmpty())
+        // non-pinned entries are contiguous no matter whether pinned entries are sorted first or last
+        val firstIndex = cache.indexOfFirst { !it.isPinned }
+        if (firstIndex < 0)
             return // nothing to remove
-        delete(cache.filter { !it.isPinned })
-        listener?.onClipsRemoved(indicesToRemove[0], indicesToRemove.size)
+        val toRemove = cache.filter { !it.isPinned }
+        delete(toRemove)
+        listener?.onClipsRemoved(firstIndex, toRemove.size)
     }
 
     fun clear() {
-        if (count() == 0) return
+        val removedCount = count()
+        if (removedCount == 0) return
         cache.clear()
-        listener?.onClipsRemoved(0, count())
+        listener?.onClipsRemoved(0, removedCount)
         db.writableDatabase.delete(TABLE, null, null)
     }
 
@@ -273,7 +289,12 @@ class ClipboardDao private constructor(private val db: Database) {
         lateinit var clipFilesDir: File
             private set
 
-        /** Returns the instance or creates a new one. Returns null if instance can't be created (e.g. no access to db due to device being locked) */
+        /**
+         * Returns the instance or creates a new one, which reads the whole table and checks the clip
+         * files, so the first call should happen on a background thread.
+         * Returns null if instance can't be created (e.g. no access to db due to device being locked)
+         */
+        @Synchronized
         fun getInstance(context: Context): ClipboardDao? {
             if (instance == null)
                 try {
