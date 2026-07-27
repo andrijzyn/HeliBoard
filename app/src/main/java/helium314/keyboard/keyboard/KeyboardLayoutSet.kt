@@ -7,6 +7,7 @@ package helium314.keyboard.keyboard
 
 import android.content.Context
 import android.text.InputType
+import android.util.LruCache
 import android.view.inputmethod.EditorInfo
 import helium314.keyboard.keyboard.internal.KeyboardBuilder
 import helium314.keyboard.keyboard.internal.KeyboardIconsSet.Companion.needsReload
@@ -26,7 +27,6 @@ import helium314.keyboard.latin.utils.ResourceUtils
 import helium314.keyboard.latin.utils.ScriptUtils
 import helium314.keyboard.latin.utils.ScriptUtils.script
 import helium314.keyboard.latin.utils.SubtypeLocaleUtils.clearSubtypeDisplayNameCache
-import java.lang.ref.SoftReference
 
 /**
  * This class represents a set of keyboard layouts. Each of them represents a different keyboard
@@ -69,11 +69,10 @@ class KeyboardLayoutSet internal constructor(private val mContext: Context, priv
     }
 
     private fun getKeyboard(id: KeyboardId): Keyboard {
-        val ref = keyboardCache[id]
-        val cachedKeyboard = ref?.get()
+        val cachedKeyboard = keyboardCache.get(id)
         if (cachedKeyboard != null) {
             if (DEBUG_CACHE) {
-                Log.d(TAG, "keyboard cache size=${keyboardCache.size}: HIT  id=$id")
+                Log.d(TAG, "keyboard cache size=${keyboardCache.size()}: HIT  id=$id")
             }
             return cachedKeyboard
         }
@@ -85,21 +84,9 @@ class KeyboardLayoutSet internal constructor(private val mContext: Context, priv
             builder.disableTouchPositionCorrectionDataForTest()
         }
         val keyboard = builder.build()
-        keyboardCache[id] = SoftReference<Keyboard>(keyboard)
-        if (!mParams.isSpellChecker
-            && (id.element == KeyboardElement.ALPHABET || id.element == KeyboardElement.ALPHABET_AUTOMATIC_SHIFTED)
-        ) {
-            // We only forcibly cache the primary, "ALPHABET", layouts.
-            for (i in forcibleKeyboardCache.size - 1 downTo 1) {
-                forcibleKeyboardCache[i] = forcibleKeyboardCache[i - 1]
-            }
-            forcibleKeyboardCache[0] = keyboard
-            if (DEBUG_CACHE) {
-                Log.d(TAG, "forcing caching of keyboard with id=$id")
-            }
-        }
+        keyboardCache.put(id, keyboard)
         if (DEBUG_CACHE) {
-            Log.d(TAG, ("keyboard cache size=${keyboardCache.size}: ${(if (ref == null) "LOAD" else "GCed")} id=$id"))
+            Log.d(TAG, "keyboard cache size=${keyboardCache.size()}: LOAD id=$id")
         }
         return keyboard
     }
@@ -252,16 +239,13 @@ class KeyboardLayoutSet internal constructor(private val mContext: Context, priv
 
         class KeyboardLayoutSetException(cause: Throwable, val keyboardId: KeyboardId) : RuntimeException(cause)
 
-        // How many layouts we forcibly keep in cache. This only includes ALPHABET (default) and
-        // ALPHABET_AUTOMATIC_SHIFTED layouts - other layouts may stay in memory in the map of
-        // soft-references, but we forcibly cache this many alphabetic/auto-shifted layouts.
-        private const val FORCIBLE_CACHE_SIZE = 4
+        // How many keyboards we keep in the cache. Holds the alphabet, shifted and symbols layouts
+        // of the most recently used subtypes; evicted keyboards are simply rebuilt on demand.
+        // Replaces the old SoftReference map (Android clears soft references very eagerly, which
+        // needed a workaround of a second array of hard references to the alphabet keyboards).
+        private const val KEYBOARD_CACHE_SIZE = 12
 
-        // By construction of soft references, anything that is also referenced somewhere else
-        // will stay in the cache. So we forcibly keep some references in an array to prevent
-        // them from disappearing from sKeyboardCache.
-        private val forcibleKeyboardCache = arrayOfNulls<Keyboard>(FORCIBLE_CACHE_SIZE)
-        private val keyboardCache = HashMap<KeyboardId, SoftReference<Keyboard>>()
+        private val keyboardCache = LruCache<KeyboardId, Keyboard>(KEYBOARD_CACHE_SIZE)
         private val uniqueKeysCache = UniqueKeysCache.newInstance()
 
         fun onSystemLocaleChanged() {
@@ -275,7 +259,7 @@ class KeyboardLayoutSet internal constructor(private val mContext: Context, priv
         }
 
         private fun clearKeyboardCache() {
-            keyboardCache.clear()
+            keyboardCache.evictAll()
             uniqueKeysCache.clear()
             LayoutParser.clearCache()
             needsReload = true

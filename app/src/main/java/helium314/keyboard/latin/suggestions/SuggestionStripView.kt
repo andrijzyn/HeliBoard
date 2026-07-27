@@ -292,7 +292,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         setToolbarButtonsActivatedStateOnPrefChange(pinnedKeys, key)
         setToolbarButtonsActivatedStateOnPrefChange(toolbar, key)
         if (key == Settings.PREF_ALWAYS_INCOGNITO_MODE)
-            GlobalScope.launch { delay(10); withContext(Dispatchers.Main) { updateKeys() } }
+            postDelayed({ updateKeys() }, 10) // need to wait until SettingsValues are reloaded
     }
 
     override fun onVisibilityChanged(view: View, visibility: Int) {
