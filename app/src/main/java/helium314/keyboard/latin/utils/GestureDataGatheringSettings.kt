@@ -85,6 +85,7 @@ object GestureDataGatheringSettings {
         setWordExclusions(context, getWordExclusions(context) + exclusion)
     }
 
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
     fun setWordExclusions(context: Context, list: Collection<String>) {
         excludedWords = null
         val json = Json.encodeToString(list)

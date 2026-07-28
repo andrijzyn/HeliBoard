@@ -158,6 +158,7 @@ class KeyboardAccessibilityNodeProvider<KV : KeyboardView>(
             // We are requested to create an AccessibilityNodeInfo describing
             // this View, i.e. the root of the virtual sub-tree.
             val rootInfo = AccessibilityNodeInfoCompat.obtain(mKeyboardView)
+            @Suppress("deprecation")
             ViewCompat.onInitializeAccessibilityNodeInfo(mKeyboardView, rootInfo)
             updateParentLocation()
             // Add the virtual children of the root View.
@@ -190,6 +191,7 @@ class KeyboardAccessibilityNodeProvider<KV : KeyboardView>(
         info.packageName = mKeyboardView.context.packageName
         info.className = key.javaClass.name
         info.contentDescription = keyDescription
+        @Suppress("deprecation")
         info.setBoundsInParent(boundsInParent)
         info.setBoundsInScreen(boundsInScreen)
         info.setParent(mKeyboardView)

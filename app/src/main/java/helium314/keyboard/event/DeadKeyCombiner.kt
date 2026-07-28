@@ -265,7 +265,7 @@ class DeadKeyCombiner : Combiner {
                 index -= Character.charCount(codePoint)
             } while (index > 0)
             // can't be null because
-            return lastEvent!!
+            return lastEvent
         }
     }
 }

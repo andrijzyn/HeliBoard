@@ -66,11 +66,10 @@ class AccessibilityUtils private constructor() {
      */
     fun shouldObscureInput(inputType: Int): Boolean {
         // The user can optionally force speaking passwords.
-        if (Settings.Secure.ACCESSIBILITY_SPEAK_PASSWORD != null) {
-            val speakPassword = Settings.Secure.getInt(mContext.contentResolver,
-                    Settings.Secure.ACCESSIBILITY_SPEAK_PASSWORD, 0) != 0
-            if (speakPassword) return false
-        }
+        @Suppress("deprecation")
+        val speakPassword = Settings.Secure.getInt(mContext.contentResolver,
+                Settings.Secure.ACCESSIBILITY_SPEAK_PASSWORD, 0) != 0
+        if (speakPassword) return false
         // Always speak if the user is listening through headphones.
         val listeningThroughHeadphones = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             @Suppress("deprecation") // no replacement available
@@ -154,6 +153,7 @@ class AccessibilityUtils private constructor() {
         event.text.add(text)
         // Platforms starting at SDK version 16 (Build.VERSION_CODES.JELLY_BEAN) should use
         // announce events.
+        @Suppress("deprecation")
         event.eventType = AccessibilityEvent.TYPE_ANNOUNCEMENT
         val viewParent = view.parent
         if (viewParent == null || viewParent !is ViewGroup) {
